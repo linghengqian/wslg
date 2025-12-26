@@ -36,6 +36,7 @@ constexpr auto c_systemDistroEnvSection = "system-distro-env";
 
 constexpr auto c_windowsSystem32 = "/mnt/c/Windows/System32";
 constexpr auto c_ibusDaemonPath = "/usr/bin/ibus-daemon";
+constexpr auto c_sessionBusPath = SHARE_PATH "/runtime-dir/bus";
 
 constexpr auto c_westonShellDesktopEnv = "WSL2_WESTON_SHELL_DESKTOP";
 
@@ -326,14 +327,13 @@ try {
         sessionBusAddress = existingBusAddress;
     } else {
         sessionBusAddress = "unix:path=";
-        sessionBusAddress += c_xdgRuntimeDir;
-        sessionBusAddress += "/bus";
+        sessionBusAddress += c_sessionBusPath;
         setenv("DBUS_SESSION_BUS_ADDRESS", sessionBusAddress.c_str(), false);
     }
 
     bool enableIme = GetEnvBool("WSLG_ENABLE_IME", true);
     bool haveIbusDaemon = (access(c_ibusDaemonPath, X_OK) == 0);
-    bool sessionBusExists = std::filesystem::exists(std::string(c_xdgRuntimeDir) + "/bus");
+    bool sessionBusExists = std::filesystem::exists(c_sessionBusPath);
     if (enableIme && haveIbusDaemon) {
         if (!sessionBusExists) {
             std::string sessionBusArg("--address=");
@@ -353,7 +353,7 @@ try {
             "--replace",
             "--xim"
         });
-    } else if (enableIme && !haveIbusDaemon) {
+    } else if (enableIme) {
         LOG_INFO("IME auto-start requested but ibus-daemon was not found, skipping.");
     }
 
