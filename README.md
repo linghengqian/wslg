@@ -115,6 +115,10 @@ Once these applications are installed, you'll find them in your start menu under
 * `teams`
 * `microsoft-edge`
 
+### Input Method (IME) support
+
+WSLg will attempt to start an `ibus` input method automatically when the daemon is available inside the system distro.  Environment variables such as `GTK_IM_MODULE`, `QT_IM_MODULE`, `XMODIFIERS`, and `IBUS_USE_PORTAL` are set to prefer `ibus` by default; you can opt out by setting `WSLG_ENABLE_IME=false` before starting WSLg.  If your user distro does not yet have `ibus` installed, add it through your package manager to enable IME features.
+
 # WSLg Architecture Overview
 
 ![WSLg Architecture Overview](/docs/WSLg_ArchitectureOverview.png)

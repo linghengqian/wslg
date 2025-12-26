@@ -35,6 +35,7 @@ constexpr auto c_userProfileEnv = "WSL2_USER_PROFILE";
 constexpr auto c_systemDistroEnvSection = "system-distro-env";
 
 constexpr auto c_windowsSystem32 = "/mnt/c/Windows/System32";
+constexpr auto c_ibusDaemonPath = "/usr/bin/ibus-daemon";
 
 constexpr auto c_westonShellDesktopEnv = "WSL2_WESTON_SHELL_DESKTOP";
 
@@ -241,6 +242,11 @@ try {
         {"PULSE_AUDIO_RDP_SOURCE", SHARE_PATH "/PulseAudioRDPSource", false},
         {"WSL2_DEFAULT_APP_ICON", DEFAULT_ICON_PATH "/wsl/linux.png", false},
         {"WSL2_DEFAULT_APP_OVERLAY_ICON", DEFAULT_ICON_PATH "/wsl/linux.png", false},
+        {"GTK_IM_MODULE", "ibus", false},
+        {"QT_IM_MODULE", "ibus", false},
+        {"XMODIFIERS", "@im=ibus", false},
+        {"SDL_IM_MODULE", "ibus", false},
+        {"IBUS_USE_PORTAL", "1", false},
     };
 
     for (auto &var : variables) {
@@ -312,6 +318,44 @@ try {
     std::filesystem::create_directories(c_xdgRuntimeDir);
     THROW_LAST_ERROR_IF(chown(c_xdgRuntimeDir, passwordEntry->pw_uid, passwordEntry->pw_gid) < 0);
     THROW_LAST_ERROR_IF(chmod(c_xdgRuntimeDir, 0777) < 0);
+
+    // Initialize a shared session bus and IME daemon when available.
+    std::string sessionBusAddress;
+    const char *existingBusAddress = getenv("DBUS_SESSION_BUS_ADDRESS");
+    if (existingBusAddress) {
+        sessionBusAddress = existingBusAddress;
+    } else {
+        sessionBusAddress = "unix:path=";
+        sessionBusAddress += c_xdgRuntimeDir;
+        sessionBusAddress += "/bus";
+        setenv("DBUS_SESSION_BUS_ADDRESS", sessionBusAddress.c_str(), false);
+    }
+
+    bool enableIme = GetEnvBool("WSLG_ENABLE_IME", true);
+    bool haveIbusDaemon = (access(c_ibusDaemonPath, X_OK) == 0);
+    bool sessionBusExists = std::filesystem::exists(std::string(c_xdgRuntimeDir) + "/bus");
+    if (enableIme && haveIbusDaemon) {
+        if (!sessionBusExists) {
+            std::string sessionBusArg("--address=");
+            sessionBusArg += sessionBusAddress;
+            monitor.LaunchProcess(std::vector<std::string>{
+                "/usr/bin/dbus-daemon",
+                "--session",
+                std::move(sessionBusArg),
+                "--nofork",
+                "--nopidfile"
+            });
+        }
+
+        monitor.LaunchProcess(std::vector<std::string>{
+            c_ibusDaemonPath,
+            "--daemonize",
+            "--replace",
+            "--xim"
+        });
+    } else if (enableIme && !haveIbusDaemon) {
+        LOG_INFO("IME auto-start requested but ibus-daemon was not found, skipping.");
+    }
 
     // Attempt to mount the virtiofs share for shared memory.
     bool isSharedMemoryMounted = false; 
