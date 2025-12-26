@@ -334,37 +334,42 @@ try {
     }
 
     bool enableIme = GetEnvBool("WSLG_ENABLE_IME", true);
+    bool haveDbusDaemon = (access(c_dbusDaemonPath, X_OK) == 0);
     bool haveIbusDaemon = (access(c_ibusDaemonPath, X_OK) == 0);
     if (enableIme && haveIbusDaemon) {
-        bool sessionBusExists = std::filesystem::exists(c_sessionBusPath);
-        if (!sessionBusExists) {
-            std::string sessionBusArg("--address=");
-            sessionBusArg += sessionBusAddress;
-            monitor.LaunchProcess(std::vector<std::string>{
-                c_dbusDaemonPath,
-                "--session",
-                std::move(sessionBusArg),
-                "--nofork",
-                "--nopidfile"
-            });
+        if (haveDbusDaemon) {
+            bool sessionBusExists = std::filesystem::exists(c_sessionBusPath);
+            if (!sessionBusExists) {
+                std::string sessionBusArg("--address=");
+                sessionBusArg += sessionBusAddress;
+                monitor.LaunchProcess(std::vector<std::string>{
+                    c_dbusDaemonPath,
+                    "--session",
+                    std::move(sessionBusArg),
+                    "--nofork",
+                    "--nopidfile"
+                });
 
-            // Wait briefly for the session bus socket to materialize.
-            for (int retry = 0; retry < c_sessionBusWaitRetries && !sessionBusExists; ++retry) {
-                usleep(c_sessionBusRetryDelayUs);
-                sessionBusExists = std::filesystem::exists(c_sessionBusPath);
+                // Wait briefly for the session bus socket to materialize.
+                for (int retry = 0; retry < c_sessionBusWaitRetries && !sessionBusExists; ++retry) {
+                    usleep(c_sessionBusRetryDelayUs);
+                    sessionBusExists = std::filesystem::exists(c_sessionBusPath);
+                }
             }
-        }
 
-        if (sessionBusExists) {
-            setenv("DBUS_SESSION_BUS_ADDRESS", sessionBusAddress.c_str(), false);
-            monitor.LaunchProcess(std::vector<std::string>{
-                c_ibusDaemonPath,
-                "--daemonize",
-                "--replace",
-                "--xim"
-            });
+            if (sessionBusExists) {
+                setenv("DBUS_SESSION_BUS_ADDRESS", sessionBusAddress.c_str(), false);
+                monitor.LaunchProcess(std::vector<std::string>{
+                    c_ibusDaemonPath,
+                    "--daemonize",
+                    "--replace",
+                    "--xim"
+                });
+            } else {
+                LOG_ERROR("IME auto-start skipped because session bus %s did not become available.", c_sessionBusPath);
+            }
         } else {
-            LOG_ERROR("IME auto-start skipped because session bus %s did not become available.", c_sessionBusPath);
+            LOG_ERROR("IME auto-start skipped because session bus launcher %s was not found.", c_dbusDaemonPath);
         }
     } else if (enableIme) {
         LOG_INFO("IME auto-start requested but ibus-daemon was not found, skipping.");
