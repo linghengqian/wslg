@@ -351,14 +351,17 @@ try {
                 });
 
                 // Wait briefly for the session bus socket to materialize.
-                for (int retry = 0; retry < c_sessionBusWaitRetries && !sessionBusExists; ++retry) {
+                for (int retry = 0; retry < c_sessionBusWaitRetries; ++retry) {
+                    if (std::filesystem::exists(c_sessionBusPath)) {
+                        sessionBusExists = true;
+                        break;
+                    }
                     usleep(c_sessionBusRetryDelayUs);
-                    sessionBusExists = std::filesystem::exists(c_sessionBusPath);
                 }
             }
 
             if (sessionBusExists) {
-                setenv("DBUS_SESSION_BUS_ADDRESS", sessionBusAddress.c_str(), false);
+                THROW_LAST_ERROR_IF(setenv("DBUS_SESSION_BUS_ADDRESS", sessionBusAddress.c_str(), false) < 0);
                 monitor.LaunchProcess(std::vector<std::string>{
                     c_ibusDaemonPath,
                     "--daemonize",
