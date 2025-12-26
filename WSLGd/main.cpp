@@ -38,6 +38,8 @@ constexpr auto c_windowsSystem32 = "/mnt/c/Windows/System32";
 constexpr auto c_dbusDaemonPath = "/usr/bin/dbus-daemon";
 constexpr auto c_ibusDaemonPath = "/usr/bin/ibus-daemon";
 constexpr auto c_sessionBusPath = SHARE_PATH "/runtime-dir/bus";
+constexpr int c_sessionBusWaitRetries = 50;
+constexpr useconds_t c_sessionBusRetryDelayUs = 10000;
 
 constexpr auto c_westonShellDesktopEnv = "WSL2_WESTON_SHELL_DESKTOP";
 
@@ -333,8 +335,8 @@ try {
 
     bool enableIme = GetEnvBool("WSLG_ENABLE_IME", true);
     bool haveIbusDaemon = (access(c_ibusDaemonPath, X_OK) == 0);
-    bool sessionBusExists = std::filesystem::exists(c_sessionBusPath);
     if (enableIme && haveIbusDaemon) {
+        bool sessionBusExists = std::filesystem::exists(c_sessionBusPath);
         if (!sessionBusExists) {
             std::string sessionBusArg("--address=");
             sessionBusArg += sessionBusAddress;
@@ -347,18 +349,23 @@ try {
             });
 
             // Wait briefly for the session bus socket to materialize.
-            for (int retry = 0; retry < 50 && !std::filesystem::exists(c_sessionBusPath); ++retry) {
-                usleep(10000);
+            for (int retry = 0; retry < c_sessionBusWaitRetries && !sessionBusExists; ++retry) {
+                usleep(c_sessionBusRetryDelayUs);
+                sessionBusExists = std::filesystem::exists(c_sessionBusPath);
             }
         }
 
-        setenv("DBUS_SESSION_BUS_ADDRESS", sessionBusAddress.c_str(), false);
-        monitor.LaunchProcess(std::vector<std::string>{
-            c_ibusDaemonPath,
-            "--daemonize",
-            "--replace",
-            "--xim"
-        });
+        if (sessionBusExists) {
+            setenv("DBUS_SESSION_BUS_ADDRESS", sessionBusAddress.c_str(), false);
+            monitor.LaunchProcess(std::vector<std::string>{
+                c_ibusDaemonPath,
+                "--daemonize",
+                "--replace",
+                "--xim"
+            });
+        } else {
+            LOG_ERROR("IME auto-start skipped because session bus %s did not become available.", c_sessionBusPath);
+        }
     } else if (enableIme) {
         LOG_INFO("IME auto-start requested but ibus-daemon was not found, skipping.");
     }
