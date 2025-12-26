@@ -35,6 +35,7 @@ constexpr auto c_userProfileEnv = "WSL2_USER_PROFILE";
 constexpr auto c_systemDistroEnvSection = "system-distro-env";
 
 constexpr auto c_windowsSystem32 = "/mnt/c/Windows/System32";
+constexpr auto c_dbusDaemonPath = "/usr/bin/dbus-daemon";
 constexpr auto c_ibusDaemonPath = "/usr/bin/ibus-daemon";
 constexpr auto c_sessionBusPath = SHARE_PATH "/runtime-dir/bus";
 
@@ -328,7 +329,6 @@ try {
     } else {
         sessionBusAddress = "unix:path=";
         sessionBusAddress += c_sessionBusPath;
-        setenv("DBUS_SESSION_BUS_ADDRESS", sessionBusAddress.c_str(), false);
     }
 
     bool enableIme = GetEnvBool("WSLG_ENABLE_IME", true);
@@ -339,14 +339,20 @@ try {
             std::string sessionBusArg("--address=");
             sessionBusArg += sessionBusAddress;
             monitor.LaunchProcess(std::vector<std::string>{
-                "/usr/bin/dbus-daemon",
+                c_dbusDaemonPath,
                 "--session",
                 std::move(sessionBusArg),
                 "--nofork",
                 "--nopidfile"
             });
+
+            // Wait briefly for the session bus socket to materialize.
+            for (int retry = 0; retry < 50 && !std::filesystem::exists(c_sessionBusPath); ++retry) {
+                usleep(10000);
+            }
         }
 
+        setenv("DBUS_SESSION_BUS_ADDRESS", sessionBusAddress.c_str(), false);
         monitor.LaunchProcess(std::vector<std::string>{
             c_ibusDaemonPath,
             "--daemonize",
