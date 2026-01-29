@@ -183,7 +183,7 @@ WORKDIR /work/vendor/mesa
 RUN /usr/bin/meson --prefix=${PREFIX} build \
         --buildtype=${BUILDTYPE_NODEBUGSTRIP} \
         -Dgallium-drivers=swrast,d3d12 \
-        -Dvulkan-drivers= \
+        -Dvulkan-drivers=swrast,microsoft-experimental \
         -Dllvm=disabled && \
     ninja -C build -j8 install && \
     echo 'mesa:' `git --git-dir=/work/vendor/mesa/.git rev-parse --verify HEAD` >> /work/versions.txt

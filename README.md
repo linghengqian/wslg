@@ -162,11 +162,13 @@ For audio in (microphone) and out (speakers/headphone) WSLg runs a PulseAudio se
 ## WSL Dynamic Virtual Channel Plugin (WSLDVCPlugin)
 WSLg makes use of a custom RDP virtual channel between the Weston RDP Server and the mstsc RDP Client running on the Windows host. This channel is used by Weston to enumerate all Linux GUI applications (i.e. applications which have a desktop file entry of type gui) along with their launch command line and icon. The open source [WSLDVCPlugin](https://github.com/microsoft/wslg/tree/main/WSLDVCPlugin) processes the list of Linux GUI applications sent over this channel and creates links for them in the Windows start menu.
 
-# OpenGL accelerated rendering in WSLg
+# OpenGL and Vulkan accelerated rendering in WSLg
 
 While WSLg works with or without virtual GPU support, if you intend to run graphics intensive applications such as Blender or Gazebo, it is best to be running on a system with a GPU and driver that can support WSL. An overview of our vGPU architecture and how we make it possible for Linux applications to access the GPU in WSL is available at our [DirectX blog](https://devblogs.microsoft.com/directx/directx-heart-linux/).
 
 Support for OpenGL accelerated rendering is made possible through the work our D3D team has done with Collabora and the Mesa community on creating a [d3d12 Gallium driver](https://devblogs.microsoft.com/directx/in-the-works-opencl-and-opengl-mapping-layers-to-directx/). 
+
+Vulkan rendering is available through Mesa's Dozen (D3D12) and Lavapipe drivers when the system distro is built with Vulkan enabled. In a default WSLg install, Vulkan acceleration depends on the Mesa version installed in the user distro and may require updating to a release that includes the Dozen Vulkan driver. The system distro build in this repository enables those Vulkan drivers in Mesa.
 
 Support for Linux, including support for WSLg, has been upstream and part of the Mesa 21.0 release. To take advantage of this acceleration, you'll need to update the version of Mesa installed in your user distro. It also requires that your distro vendor chose to build and publish the new d3d12 Gallium driver to their package repository. We're working with the various WSL distro publishers to inform them of these changes.
 
