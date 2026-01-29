@@ -166,7 +166,7 @@ WSLg makes use of a custom RDP virtual channel between the Weston RDP Server and
 
 While WSLg works with or without virtual GPU support, if you intend to run graphics intensive applications such as Blender or Gazebo, it is best to be running on a system with a GPU and driver that can support WSL. An overview of our vGPU architecture and how we make it possible for Linux applications to access the GPU in WSL is available at our [DirectX blog](https://devblogs.microsoft.com/directx/directx-heart-linux/).
 
-Support for OpenGL accelerated rendering is made possible through the work our D3D team has done with Collabora and the Mesa community on creating a [d3d12 Gallium driver](https://devblogs.microsoft.com/directx/in-the-works-opencl-and-opengl-mapping-layers-to-directx/). 
+Support for OpenGL accelerated rendering is made possible through the work our D3D team has done with Collabora and the Mesa community on creating a [d3d12 Gallium driver](https://devblogs.microsoft.com/directx/in-the-works-opencl-and-opengl-mapping-layers-to-directx/).
 
 Vulkan rendering is available through Mesa's Dozen (D3D12) and Lavapipe drivers when the system distro is built with Vulkan enabled (Mesa names: microsoft-experimental for Dozen and swrast for Lavapipe). In a default WSLg install, Vulkan acceleration depends on the Mesa version installed in the user distro and may require updating to a release that includes the Dozen Vulkan driver. The system distro build in this repository enables those Vulkan drivers in Mesa.
 
