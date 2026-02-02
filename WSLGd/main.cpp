@@ -23,9 +23,9 @@ constexpr auto c_versionMount = SHARE_PATH "/versions.txt";
 constexpr auto c_shareDocsDir = "/usr/share/doc";
 constexpr auto c_shareDocsMount = SHARE_PATH "/doc";
 constexpr auto c_x11RuntimeDir = SHARE_PATH "/.X11-unix";
+constexpr auto c_x11SocketDir = "/tmp/.X11-unix";
 constexpr auto c_xdgRuntimeDir = SHARE_PATH "/runtime-dir";
 constexpr auto c_stdErrLogFile = SHARE_PATH "/stderr.log";
-constexpr auto c_x11SocketDir = "/tmp/.X11-unix";
 
 constexpr auto c_sharedMemoryMountPoint = "/mnt/shared_memory";
 constexpr auto c_sharedMemoryMountPointEnv = "WSL2_SHARED_MEMORY_MOUNT_POINT";
@@ -214,16 +214,25 @@ void WaitForReadyNotify(int notifyFd)
 
 void SetX11SocketPermissions()
 {
-    constexpr auto c_stickyAllExec = S_ISVTX | S_IRWXU | S_IRWXG | S_IRWXO;
+    // /tmp/.X11-unix follows /tmp semantics with the sticky bit set (01777).
+    constexpr auto c_x11SocketDirMode = S_ISVTX | S_IRWXU | S_IRWXG | S_IRWXO;
+    constexpr auto c_x11SocketDirModeMask = S_ISUID | S_ISGID | S_ISVTX | S_IRWXU | S_IRWXG | S_IRWXO;
     struct stat statResult {};
     if (stat(c_x11SocketDir, &statResult) == 0) {
-        if ((statResult.st_mode & c_stickyAllExec) != c_stickyAllExec) {
-            if (chmod(c_x11SocketDir, c_stickyAllExec) < 0) {
-                LOG_ERROR("Failed to set sticky bit on %s: %s.", c_x11SocketDir, strerror(errno));
+        if ((statResult.st_mode & c_x11SocketDirModeMask) != c_x11SocketDirMode) {
+            if (chmod(c_x11SocketDir, c_x11SocketDirMode) < 0) {
+                LOG_ERROR("Failed to set permissions on %s; Xwayland may fail to start: %s.", c_x11SocketDir, strerror(errno));
             }
         }
     } else {
-        LOG_ERROR("Failed to stat %s: %s.", c_x11SocketDir, strerror(errno));
+        auto lastError = errno;
+        if (lastError == ENOENT) {
+            LOG_ERROR("%s does not exist; Xwayland may fail to start if the host mount is missing.", c_x11SocketDir);
+        } else if (lastError == EACCES) {
+            LOG_ERROR("Permission denied while checking %s; Xwayland may fail to start: %s.", c_x11SocketDir, strerror(lastError));
+        } else {
+            LOG_ERROR("Failed to stat %s; Xwayland may fail to start: %s.", c_x11SocketDir, strerror(lastError));
+        }
     }
 }
 
