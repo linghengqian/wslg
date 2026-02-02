@@ -25,6 +25,7 @@ constexpr auto c_shareDocsMount = SHARE_PATH "/doc";
 constexpr auto c_x11RuntimeDir = SHARE_PATH "/.X11-unix";
 constexpr auto c_xdgRuntimeDir = SHARE_PATH "/runtime-dir";
 constexpr auto c_stdErrLogFile = SHARE_PATH "/stderr.log";
+constexpr auto c_x11SocketDir = "/tmp/.X11-unix";
 
 constexpr auto c_sharedMemoryMountPoint = "/mnt/shared_memory";
 constexpr auto c_sharedMemoryMountPointEnv = "WSL2_SHARED_MEMORY_MOUNT_POINT";
@@ -209,6 +210,21 @@ void WaitForReadyNotify(int notifyFd)
     // wait under client connects */
     wil::unique_fd fd(accept(notifyFd, 0, 0));
     THROW_LAST_ERROR_IF(!fd);
+}
+
+void SetX11SocketPermissions()
+{
+    constexpr auto c_stickyAllExec = S_ISVTX | S_IRWXU | S_IRWXG | S_IRWXO;
+    struct stat statResult {};
+    if (stat(c_x11SocketDir, &statResult) == 0) {
+        if ((statResult.st_mode & c_stickyAllExec) != c_stickyAllExec) {
+            if (chmod(c_x11SocketDir, c_stickyAllExec) < 0) {
+                LOG_ERROR("Failed to set sticky bit on %s: %s.", c_x11SocketDir, strerror(errno));
+            }
+        }
+    } else {
+        LOG_ERROR("Failed to stat %s: %s.", c_x11SocketDir, strerror(errno));
+    }
 }
 
 int main(int Argc, char *Argv[])
@@ -450,6 +466,7 @@ try {
     // Wait weston to be ready before starting RDP client, pulseaudio server.
     WaitForReadyNotify(notifyFd.get());
     unlink(WESTON_NOTIFY_SOCKET);
+    SetX11SocketPermissions();
 
     // Start font monitoring if user distro's X11 fonts to be shared with system distro.
     if (GetEnvBool("WSLG_USE_USER_DISTRO_XFONTS", true))
