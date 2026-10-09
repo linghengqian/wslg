@@ -202,6 +202,15 @@ struct rdp_sink {
 	int fd;
 	int remote_version;
 	char *socket_path;
+	/* Reconnect state: after a PipeWire daemon restart the module has to
+	 * recreate its core connection and stream. The core error handler only
+	 * raises the flag; the timer (main loop context) does the work. */
+	struct pw_loop *loop;
+	struct spa_source *reconnect_timer;
+	struct pw_properties *saved_node_props;
+	char *node_name;
+	bool reconnect_requested;
+	bool reconnect_warned;
 
 	/* Socket I/O runs on a worker thread; the RT process callback only
 	 * enqueues audio into the lock-free ring, never touching the socket. */
@@ -235,6 +244,15 @@ struct rdp_source {
 	size_t frame_size;
 	int fd;
 	char *socket_path;
+	/* Reconnect state: after a PipeWire daemon restart the module has to
+	 * recreate its core connection and stream. The core error handler only
+	 * raises the flag; the timer (main loop context) does the work. */
+	struct pw_loop *loop;
+	struct spa_source *reconnect_timer;
+	struct pw_properties *saved_node_props;
+	char *node_name;
+	bool reconnect_requested;
+	bool reconnect_warned;
 	/* Socket I/O runs on a worker thread; the RT process callback only
 	 * consumes samples from the lock-free ring, never touching the socket. */
 	pthread_t worker;
@@ -258,6 +276,11 @@ static void sink_module_destroy(void *data)
 		pthread_join(sink->worker, NULL);
 		sink->worker_started = false;
 	}
+	/* Stop the reconnect timer before tearing down core/stream. */
+	if (sink->reconnect_timer) {
+		pw_loop_destroy_source(sink->loop, sink->reconnect_timer);
+		sink->reconnect_timer = NULL;
+	}
 	if (sink->stream)
 		pw_stream_destroy(sink->stream);
 	sink->stream = NULL;
@@ -269,6 +292,8 @@ static void sink_module_destroy(void *data)
 		close(sink->fd);
 	free(sink->socket_path);
 	free(sink->ring_mem);
+	pw_properties_free(sink->saved_node_props);
+	free(sink->node_name);
 	pthread_mutex_destroy(&sink->state_lock);
 	free(sink);
 }
@@ -282,6 +307,11 @@ static void source_module_destroy(void *data)
 		pthread_join(source->worker, NULL);
 		source->worker_started = false;
 	}
+	/* Stop the reconnect timer before tearing down core/stream. */
+	if (source->reconnect_timer) {
+		pw_loop_destroy_source(source->loop, source->reconnect_timer);
+		source->reconnect_timer = NULL;
+	}
 	if (source->stream)
 		pw_stream_destroy(source->stream);
 	source->stream = NULL;
@@ -293,6 +323,8 @@ static void source_module_destroy(void *data)
 		close(source->fd);
 	free(source->socket_path);
 	free(source->ring_mem);
+	pw_properties_free(source->saved_node_props);
+	free(source->node_name);
 	pthread_mutex_destroy(&source->state_lock);
 	free(source);
 }
@@ -325,16 +357,24 @@ static void sink_core_error(void *data, uint32_t id, int seq, int res, const cha
 {
 	struct rdp_sink *sink = data;
 	pw_log_error("rdp sink core error: %s", message);
-	if (id == PW_ID_CORE && res == -EPIPE)
-		pw_impl_module_schedule_destroy(sink->module);
+	if (id == PW_ID_CORE && res == -EPIPE) {
+		/* The daemon went away. Do not tear down here (this runs inside
+		 * event dispatch); the reconnect timer picks this up and rebuilds
+		 * the core/stream once pipewire-0 returns. */
+		sink->reconnect_requested = true;
+	}
 }
 
 static void source_core_error(void *data, uint32_t id, int seq, int res, const char *message)
 {
 	struct rdp_source *source = data;
 	pw_log_error("rdp source core error: %s", message);
-	if (id == PW_ID_CORE && res == -EPIPE)
-		pw_impl_module_schedule_destroy(source->module);
+	if (id == PW_ID_CORE && res == -EPIPE) {
+		/* The daemon went away. Do not tear down here (this runs inside
+		 * event dispatch); the reconnect timer picks this up and rebuilds
+		 * the core/stream once pipewire-0 returns. */
+		source->reconnect_requested = true;
+	}
 }
 
 static const struct pw_core_events sink_core_events = {
@@ -646,12 +686,107 @@ static int create_sink_stream(struct rdp_sink *sink, struct pw_properties *node_
 		params, n_params);
 }
 
-static void source_buffer_mark_empty(struct spa_buffer *buf)
+/* Rebuild the core connection. A context core is shared when already
+ * present; otherwise a private connection is created and owned. */
+static int sink_connect_core(struct rdp_sink *sink, bool reuse_existing)
 {
-	if (buf && buf->datas && buf->datas[0].chunk) {
-		buf->datas[0].chunk->size = 0;
-		buf->datas[0].chunk->offset = 0;
-		buf->datas[0].chunk->stride = 0;
+	if (sink->core != NULL)
+		return 0;
+
+	if (reuse_existing) {
+		sink->core = pw_context_get_object(sink->context, PW_TYPE_INTERFACE_Core);
+		if (sink->core != NULL) {
+			pw_proxy_add_listener((struct pw_proxy*)sink->core, &sink->core_proxy_listener, &core_proxy_events, sink);
+			pw_core_add_listener(sink->core, &sink->core_listener, &sink_core_events, sink);
+			return 0;
+		}
+	}
+
+	sink->core = pw_context_connect(sink->context, NULL, 0);
+	if (sink->core == NULL) {
+		int res = -errno;
+		return res < 0 ? res : -EIO;
+	}
+	sink->core_owned = true;
+	pw_proxy_add_listener((struct pw_proxy*)sink->core, &sink->core_proxy_listener, &core_proxy_events, sink);
+	pw_core_add_listener(sink->core, &sink->core_listener, &sink_core_events, sink);
+	return 0;
+}
+
+static int sink_rebuild_stream(struct rdp_sink *sink)
+{
+	struct pw_properties *node_props;
+
+	node_props = sink->saved_node_props ?
+		pw_properties_copy(sink->saved_node_props) :
+		pw_properties_new(NULL, NULL);
+	if (node_props == NULL)
+		return errno ? -errno : -ENOMEM;
+
+	return create_sink_stream(sink, node_props, sink->node_name);
+}
+
+/* Runs on the context main loop; safe place to tear down and recreate
+ * objects (unlike the core error callback, which runs during dispatch). */
+static void sink_reconnect_timer(void *data, uint64_t expirations)
+{
+	struct rdp_sink *sink = data;
+
+	if (sink->reconnect_requested) {
+		sink->reconnect_requested = false;
+		pw_log_info("rdp sink: pipewire core went away, reconnecting");
+
+		if (sink->stream) {
+			pw_stream_destroy(sink->stream);
+			sink->stream = NULL;
+		}
+		if (sink->core) {
+			if (sink->core_owned)
+				pw_core_disconnect(sink->core);
+			sink->core = NULL;
+		}
+		sink->core_owned = false;
+		/* Make the fresh stream republish latency once known. */
+		__atomic_store_n(&sink->latency_valid, false, __ATOMIC_RELEASE);
+		sink->published_seq = 0;
+	}
+
+	if (sink->core == NULL) {
+		int res = sink_connect_core(sink, false);
+		if (res < 0) {
+			if (!sink->reconnect_warned) {
+				pw_log_warn("rdp sink: failed to reconnect to pipewire: %d", res);
+				sink->reconnect_warned = true;
+			}
+			return;
+		}
+		sink->reconnect_warned = false;
+		if (sink_rebuild_stream(sink) < 0) {
+			if (sink->stream) {
+				pw_stream_destroy(sink->stream);
+				sink->stream = NULL;
+			}
+			if (sink->core_owned)
+				pw_core_disconnect(sink->core);
+			sink->core = NULL;
+			sink->core_owned = false;
+			return;
+		}
+		pw_log_info("rdp sink: reconnected to pipewire core");
+	}
+}
+
+static void source_buffer_mark_empty(struct pw_buffer *buf)
+{
+	if (buf == NULL)
+		return;
+	/* pw_buffer::size is the number of valid frames queued; keep it
+	 * consistent with the (empty) chunk. */
+	buf->size = 0;
+	if (buf->buffer && buf->buffer->datas && buf->buffer->datas[0].chunk) {
+		buf->buffer->datas[0].chunk->size = 0;
+		buf->buffer->datas[0].chunk->offset = 0;
+		buf->buffer->datas[0].chunk->stride = 0;
 	}
 }
 
@@ -784,7 +919,7 @@ static void source_stream_process(void *data)
 	if (capacity > bd->maxsize)
 		capacity = bd->maxsize - (bd->maxsize % frame_size);
 	if (capacity == 0 || bd->data == NULL || source->ring_mem == NULL) {
-		source_buffer_mark_empty(buf->buffer);
+		source_buffer_mark_empty(buf);
 		pw_stream_queue_buffer(source->stream, buf);
 		return;
 	}
@@ -792,7 +927,7 @@ static void source_stream_process(void *data)
 	/* Never wait for microphone data; publish silence when none is staged. */
 	avail = spa_ringbuffer_get_read_index(&source->ring, &ridx);
 	if (avail <= 0) {
-		source_buffer_mark_empty(buf->buffer);
+		source_buffer_mark_empty(buf);
 		pw_stream_queue_buffer(source->stream, buf);
 		return;
 	}
@@ -801,7 +936,7 @@ static void source_stream_process(void *data)
 		n = (uint32_t)capacity;
 	n -= n % (uint32_t)frame_size;
 	if (n == 0) {
-		source_buffer_mark_empty(buf->buffer);
+		source_buffer_mark_empty(buf);
 		pw_stream_queue_buffer(source->stream, buf);
 		return;
 	}
@@ -812,6 +947,8 @@ static void source_stream_process(void *data)
 	bd->chunk->size = n;
 	bd->chunk->stride = source->frame_size;
 	bd->chunk->offset = 0;
+	/* pw_buffer::size is the queued frame count used for buffer timing. */
+	buf->size = n / frame_size;
 
 	pw_stream_queue_buffer(source->stream, buf);
 }
@@ -828,6 +965,10 @@ static void source_stream_command(void *data, const struct spa_command *command)
 		pthread_mutex_unlock(&source->state_lock);
 	} else if (id == SPA_NODE_COMMAND_Start) {
 		pthread_mutex_lock(&source->state_lock);
+		/* A rapid Pause->Start may race the worker: drop any suspend
+		 * that has not been consumed yet, otherwise the worker could
+		 * still park the stream after it has been started again. */
+		source->suspend_requested = false;
 		source->suspended = false;
 		pthread_mutex_unlock(&source->state_lock);
 	}
@@ -864,6 +1005,99 @@ static int create_source_stream(struct rdp_source *source, struct pw_properties 
 		PW_STREAM_FLAG_MAP_BUFFERS |
 		PW_STREAM_FLAG_RT_PROCESS,
 		params, n_params);
+}
+
+/* Rebuild the core connection. A context core is shared when already
+ * present; otherwise a private connection is created and owned. */
+static int source_connect_core(struct rdp_source *source, bool reuse_existing)
+{
+	if (source->core != NULL)
+		return 0;
+
+	if (reuse_existing) {
+		source->core = pw_context_get_object(source->context, PW_TYPE_INTERFACE_Core);
+		if (source->core != NULL) {
+			pw_proxy_add_listener((struct pw_proxy*)source->core, &source->core_proxy_listener, &core_proxy_events, source);
+			pw_core_add_listener(source->core, &source->core_listener, &source_core_events, source);
+			return 0;
+		}
+	}
+
+	source->core = pw_context_connect(source->context, NULL, 0);
+	if (source->core == NULL) {
+		int res = -errno;
+		return res < 0 ? res : -EIO;
+	}
+	source->core_owned = true;
+	pw_proxy_add_listener((struct pw_proxy*)source->core, &source->core_proxy_listener, &core_proxy_events, source);
+	pw_core_add_listener(source->core, &source->core_listener, &source_core_events, source);
+	return 0;
+}
+
+static int source_rebuild_stream(struct rdp_source *source)
+{
+	struct pw_properties *node_props;
+
+	node_props = source->saved_node_props ?
+		pw_properties_copy(source->saved_node_props) :
+		pw_properties_new(NULL, NULL);
+	if (node_props == NULL)
+		return errno ? -errno : -ENOMEM;
+
+	return create_source_stream(source, node_props, source->node_name);
+}
+
+/* Runs on the context main loop; safe place to tear down and recreate
+ * objects (unlike the core error callback, which runs during dispatch). */
+static void source_reconnect_timer(void *data, uint64_t expirations)
+{
+	struct rdp_source *source = data;
+
+	if (source->reconnect_requested) {
+		source->reconnect_requested = false;
+		pw_log_info("rdp source: pipewire core went away, reconnecting");
+
+		if (source->stream) {
+			pw_stream_destroy(source->stream);
+			source->stream = NULL;
+		}
+		if (source->core) {
+			if (source->core_owned)
+				pw_core_disconnect(source->core);
+			source->core = NULL;
+		}
+		source->core_owned = false;
+		/* The new stream starts fresh; do not let a suspend that was
+		 * queued for the old stream keep the worker parked. */
+		pthread_mutex_lock(&source->state_lock);
+		source->suspend_requested = false;
+		source->suspended = false;
+		pthread_mutex_unlock(&source->state_lock);
+	}
+
+	if (source->core == NULL) {
+		int res = source_connect_core(source, false);
+		if (res < 0) {
+			if (!source->reconnect_warned) {
+				pw_log_warn("rdp source: failed to reconnect to pipewire: %d", res);
+				source->reconnect_warned = true;
+			}
+			return;
+		}
+		source->reconnect_warned = false;
+		if (source_rebuild_stream(source) < 0) {
+			if (source->stream) {
+				pw_stream_destroy(source->stream);
+				source->stream = NULL;
+			}
+			if (source->core_owned)
+				pw_core_disconnect(source->core);
+			source->core = NULL;
+			source->core_owned = false;
+			return;
+		}
+		pw_log_info("rdp source: reconnected to pipewire core");
+	}
 }
 
 static int parse_audio_info(struct spa_audio_info_raw *info, struct pw_properties *props)
@@ -935,20 +1169,21 @@ static int init_sink(struct pw_impl_module *module, const char *args)
 	}
 	node_name = pw_properties_get(node_props, PW_KEY_NODE_NAME);
 
-	sink->core = pw_context_get_object(context, PW_TYPE_INTERFACE_Core);
-	if (sink->core == NULL) {
-		sink->core = pw_context_connect(context, NULL, 0);
-		if (sink->core != NULL)
-			sink->core_owned = true;
-	}
-	if (sink->core == NULL) {
-		pw_properties_free(node_props);
+	/* Keep a copy: the original is handed to the stream, and the reconnect
+	 * path needs enough state to rebuild the stream from scratch. */
+	sink->saved_node_props = pw_properties_copy(node_props);
+	sink->node_name = node_name ? strdup(node_name) : NULL;
+	if (sink->saved_node_props == NULL || sink->node_name == NULL) {
 		res = -errno;
+		pw_properties_free(node_props);
 		goto error;
 	}
 
-	pw_proxy_add_listener((struct pw_proxy*)sink->core, &sink->core_proxy_listener, &core_proxy_events, sink);
-	pw_core_add_listener(sink->core, &sink->core_listener, &sink_core_events, sink);
+	res = sink_connect_core(sink, true);
+	if (res < 0) {
+		pw_properties_free(node_props);
+		goto error;
+	}
 
 	res = create_sink_stream(sink, node_props, node_name);
 	if (res < 0)
@@ -963,6 +1198,20 @@ static int init_sink(struct pw_impl_module *module, const char *args)
 		goto error;
 	}
 	sink->worker_started = true;
+
+	/* Periodic watchdog that rebuilds the core/stream after a pipewire
+	 * daemon restart, when pipewire-pulse itself stayed alive. */
+	sink->loop = pw_context_get_main_loop(context);
+	sink->reconnect_timer = pw_loop_add_timer(sink->loop, sink_reconnect_timer, sink);
+	if (sink->reconnect_timer == NULL) {
+		res = -errno;
+		goto error;
+	}
+	{
+		struct timespec value = { .tv_sec = 1, .tv_nsec = 0 };
+		struct timespec interval = { .tv_sec = 1, .tv_nsec = 0 };
+		pw_loop_update_timer(sink->loop, sink->reconnect_timer, &value, &interval, false);
+	}
 
 	pw_impl_module_add_listener(module, &sink->module_listener, &sink_module_events, sink);
 	pw_impl_module_update_properties(module, &SPA_DICT_INIT_ARRAY(sink_module_props));
@@ -1023,20 +1272,21 @@ static int init_source(struct pw_impl_module *module, const char *args)
 	}
 	node_name = pw_properties_get(node_props, PW_KEY_NODE_NAME);
 
-	source->core = pw_context_get_object(context, PW_TYPE_INTERFACE_Core);
-	if (source->core == NULL) {
-		source->core = pw_context_connect(context, NULL, 0);
-		if (source->core != NULL)
-			source->core_owned = true;
-	}
-	if (source->core == NULL) {
-		pw_properties_free(node_props);
+	/* Keep a copy: the original is handed to the stream, and the reconnect
+	 * path needs enough state to rebuild the stream from scratch. */
+	source->saved_node_props = pw_properties_copy(node_props);
+	source->node_name = node_name ? strdup(node_name) : NULL;
+	if (source->saved_node_props == NULL || source->node_name == NULL) {
 		res = -errno;
+		pw_properties_free(node_props);
 		goto error;
 	}
 
-	pw_proxy_add_listener((struct pw_proxy*)source->core, &source->core_proxy_listener, &core_proxy_events, source);
-	pw_core_add_listener(source->core, &source->core_listener, &source_core_events, source);
+	res = source_connect_core(source, true);
+	if (res < 0) {
+		pw_properties_free(node_props);
+		goto error;
+	}
 
 	res = create_source_stream(source, node_props, node_name);
 	if (res < 0)
@@ -1051,6 +1301,20 @@ static int init_source(struct pw_impl_module *module, const char *args)
 		goto error;
 	}
 	source->worker_started = true;
+
+	/* Periodic watchdog that rebuilds the core/stream after a pipewire
+	 * daemon restart, when pipewire-pulse itself stayed alive. */
+	source->loop = pw_context_get_main_loop(context);
+	source->reconnect_timer = pw_loop_add_timer(source->loop, source_reconnect_timer, source);
+	if (source->reconnect_timer == NULL) {
+		res = -errno;
+		goto error;
+	}
+	{
+		struct timespec value = { .tv_sec = 1, .tv_nsec = 0 };
+		struct timespec interval = { .tv_sec = 1, .tv_nsec = 0 };
+		pw_loop_update_timer(source->loop, source->reconnect_timer, &value, &interval, false);
+	}
 
 	pw_impl_module_add_listener(module, &source->module_listener, &source_module_events, source);
 	pw_impl_module_update_properties(module, &SPA_DICT_INIT_ARRAY(source_module_props));
