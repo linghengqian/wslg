@@ -27,10 +27,6 @@
 
 #include <pipewire/impl.h>
 
-static const struct pw_proxy_events core_proxy_events = {
-	PW_VERSION_PROXY_EVENTS,
-};
-
 #define NAME "wslg-rdp"
 
 PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
@@ -259,6 +255,10 @@ struct rdp_source {
 	bool worker_running;
 	bool worker_started;
 	bool suspended;
+	/* Bytes discarded by the overflow path, modulo the frame size: used
+	 * to skip the partial frame once the ring drains again so the audio
+	 * written to the ring stays sample-aligned. */
+	uint32_t drop_phase;
 	uint8_t *ring_mem;
 	uint32_t ring_size;
 	struct spa_ringbuffer ring;
@@ -376,6 +376,46 @@ static void source_core_error(void *data, uint32_t id, int seq, int res, const c
 		source->reconnect_requested = true;
 	}
 }
+
+/* The core proxy can be torn down outside of our control (daemon side
+ * teardown, error handling). Detach both listener hooks and drop the
+ * pointer so the reconnect path never disconnects or reuses hooks of a
+ * freed proxy. */
+static void sink_core_destroy(void *data)
+{
+	struct rdp_sink *sink = data;
+
+	spa_hook_remove(&sink->core_listener);
+	spa_hook_remove(&sink->core_proxy_listener);
+	if (sink->core != NULL) {
+		sink->core = NULL;
+		sink->core_owned = false;
+		sink->reconnect_requested = true;
+	}
+}
+
+static void source_core_destroy(void *data)
+{
+	struct rdp_source *source = data;
+
+	spa_hook_remove(&source->core_listener);
+	spa_hook_remove(&source->core_proxy_listener);
+	if (source->core != NULL) {
+		source->core = NULL;
+		source->core_owned = false;
+		source->reconnect_requested = true;
+	}
+}
+
+static const struct pw_proxy_events sink_core_proxy_events = {
+	PW_VERSION_PROXY_EVENTS,
+	.destroy = sink_core_destroy,
+};
+
+static const struct pw_proxy_events source_core_proxy_events = {
+	PW_VERSION_PROXY_EVENTS,
+	.destroy = source_core_destroy,
+};
 
 static const struct pw_core_events sink_core_events = {
 	PW_VERSION_CORE_EVENTS,
@@ -561,14 +601,14 @@ static void sink_stream_process(void *data)
 			uint8_t pbuf[256];
 			struct spa_pod_builder b;
 			const struct spa_pod *params[1];
-			float quantum = (us > 0 && sink->info.rate > 0)
-				? (float)us * sink->info.rate / 1000000.0f : 0.0f;
 
+			/* Report the transport delay in nanoseconds only. The
+			 * quantum and rate fields are alternative units for the
+			 * same delay, not additional amounts, so leaving them at
+			 * zero avoids inflating the reported latency. */
 			info = SPA_LATENCY_INFO(SPA_DIRECTION_INPUT,
-					.min_quantum = quantum, .max_quantum = quantum,
-					.min_rate = (int32_t)sink->info.rate,
-					.max_rate = (int32_t)sink->info.rate,
-					.min_ns = (int64_t)us * 1000, .max_ns = (int64_t)us * 1000);
+					.min_ns = (int64_t)us * 1000,
+					.max_ns = (int64_t)us * 1000);
 			spa_pod_builder_init(&b, pbuf, sizeof(pbuf));
 			params[0] = spa_latency_build(&b, SPA_PARAM_Latency, &info);
 			if (params[0])
@@ -696,7 +736,7 @@ static int sink_connect_core(struct rdp_sink *sink, bool reuse_existing)
 	if (reuse_existing) {
 		sink->core = pw_context_get_object(sink->context, PW_TYPE_INTERFACE_Core);
 		if (sink->core != NULL) {
-			pw_proxy_add_listener((struct pw_proxy*)sink->core, &sink->core_proxy_listener, &core_proxy_events, sink);
+			pw_proxy_add_listener((struct pw_proxy*)sink->core, &sink->core_proxy_listener, &sink_core_proxy_events, sink);
 			pw_core_add_listener(sink->core, &sink->core_listener, &sink_core_events, sink);
 			return 0;
 		}
@@ -708,7 +748,7 @@ static int sink_connect_core(struct rdp_sink *sink, bool reuse_existing)
 		return res < 0 ? res : -EIO;
 	}
 	sink->core_owned = true;
-	pw_proxy_add_listener((struct pw_proxy*)sink->core, &sink->core_proxy_listener, &core_proxy_events, sink);
+	pw_proxy_add_listener((struct pw_proxy*)sink->core, &sink->core_proxy_listener, &sink_core_proxy_events, sink);
 	pw_core_add_listener(sink->core, &sink->core_listener, &sink_core_events, sink);
 	return 0;
 }
@@ -741,11 +781,21 @@ static void sink_reconnect_timer(void *data, uint64_t expirations)
 			sink->stream = NULL;
 		}
 		if (sink->core) {
-			if (sink->core_owned)
-				pw_core_disconnect(sink->core);
+			struct pw_core *core = sink->core;
+			bool owned = sink->core_owned;
+
+			/* Detach before disconnecting: the proxy destroy handler
+			 * treats a core that is still installed as an unexpected
+			 * teardown and would re-request a reconnect. */
 			sink->core = NULL;
+			sink->core_owned = false;
+			if (owned)
+				pw_core_disconnect(core);
+			else {
+				spa_hook_remove(&sink->core_listener);
+				spa_hook_remove(&sink->core_proxy_listener);
+			}
 		}
-		sink->core_owned = false;
 		/* Make the fresh stream republish latency once known. */
 		__atomic_store_n(&sink->latency_valid, false, __ATOMIC_RELEASE);
 		sink->published_seq = 0;
@@ -835,6 +885,8 @@ static void *source_worker_thread(void *arg)
 				continue;
 			}
 			source->fd = fd;
+			/* The peer starts a fresh stream on a frame boundary. */
+			source->drop_phase = 0;
 		}
 
 		fill = spa_ringbuffer_get_write_index(&source->ring, &widx);
@@ -859,11 +911,17 @@ static void *source_worker_thread(void *arg)
 
 		if (free == 0) {
 			/* Overrun with no capture client draining: recv and drop
-			 * so the peer keeps flowing and latency stays bounded. */
-			if (recv(source->fd, tmp, sizeof(tmp), 0) <= 0) {
+			 * so the peer keeps flowing and latency stays bounded.
+			 * Track the dropped byte count modulo the frame size so
+			 * retained audio resumes on a frame boundary instead of
+			 * mid-sample. */
+			ssize_t n = recv(source->fd, tmp, sizeof(tmp), 0);
+			if (n <= 0) {
 				close(source->fd);
 				source->fd = -1;
-			} else {
+			} else if (source->frame_size > 0) {
+				source->drop_phase = (source->drop_phase + (uint32_t)n) %
+					(uint32_t)source->frame_size;
 				sleep_ms(5);
 			}
 			continue;
@@ -883,6 +941,21 @@ static void *source_worker_thread(void *arg)
 				close(source->fd);
 				source->fd = -1;
 				continue;
+			}
+			/* Skip the remainder of the partial frame dropped by the
+			 * overflow path before writing to the ring. */
+			if (source->drop_phase > 0 && source->frame_size > 0) {
+				size_t frame_size = source->frame_size;
+				size_t skip = frame_size - source->drop_phase;
+
+				if ((size_t)n <= skip) {
+					source->drop_phase = (source->drop_phase + (uint32_t)n) %
+						(uint32_t)frame_size;
+					continue;
+				}
+				memmove(tmp, tmp + skip, (size_t)n - skip);
+				n -= (ssize_t)skip;
+				source->drop_phase = 0;
 			}
 			spa_ringbuffer_write_data(&source->ring, source->ring_mem, source->ring_size,
 					widx & (source->ring_size - 1), tmp, (uint32_t)n);
@@ -1017,7 +1090,7 @@ static int source_connect_core(struct rdp_source *source, bool reuse_existing)
 	if (reuse_existing) {
 		source->core = pw_context_get_object(source->context, PW_TYPE_INTERFACE_Core);
 		if (source->core != NULL) {
-			pw_proxy_add_listener((struct pw_proxy*)source->core, &source->core_proxy_listener, &core_proxy_events, source);
+			pw_proxy_add_listener((struct pw_proxy*)source->core, &source->core_proxy_listener, &source_core_proxy_events, source);
 			pw_core_add_listener(source->core, &source->core_listener, &source_core_events, source);
 			return 0;
 		}
@@ -1029,7 +1102,7 @@ static int source_connect_core(struct rdp_source *source, bool reuse_existing)
 		return res < 0 ? res : -EIO;
 	}
 	source->core_owned = true;
-	pw_proxy_add_listener((struct pw_proxy*)source->core, &source->core_proxy_listener, &core_proxy_events, source);
+	pw_proxy_add_listener((struct pw_proxy*)source->core, &source->core_proxy_listener, &source_core_proxy_events, source);
 	pw_core_add_listener(source->core, &source->core_listener, &source_core_events, source);
 	return 0;
 }
@@ -1062,11 +1135,21 @@ static void source_reconnect_timer(void *data, uint64_t expirations)
 			source->stream = NULL;
 		}
 		if (source->core) {
-			if (source->core_owned)
-				pw_core_disconnect(source->core);
+			struct pw_core *core = source->core;
+			bool owned = source->core_owned;
+
+			/* Detach before disconnecting: the proxy destroy handler
+			 * treats a core that is still installed as an unexpected
+			 * teardown and would re-request a reconnect. */
 			source->core = NULL;
+			source->core_owned = false;
+			if (owned)
+				pw_core_disconnect(core);
+			else {
+				spa_hook_remove(&source->core_listener);
+				spa_hook_remove(&source->core_proxy_listener);
+			}
 		}
-		source->core_owned = false;
 		/* The new stream starts fresh; do not let a suspend that was
 		 * queued for the old stream keep the worker parked. */
 		pthread_mutex_lock(&source->state_lock);
